@@ -17,7 +17,10 @@ import (
 
 	pb "github.com/Arvin619/grpc-demo/proto"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/recovery"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var port string
@@ -32,6 +35,9 @@ type GreeterServer struct {
 }
 
 func (gs *GreeterServer) SayHello(ctx context.Context, pr *pb.HelloRequest) (*pb.HelloReply, error) {
+	if time.Now().Minute()%2 == 0 {
+		panic("panic !!!!!!")
+	}
 	return &pb.HelloReply{Message: "hello.world"}, nil
 }
 
@@ -110,6 +116,10 @@ func InterceptorLogger(l *log.Logger) logging.Logger {
 	})
 }
 
+func recoveryHandler(p any) error {
+	return status.Errorf(codes.Unknown, "panic triggered: %v", p)
+}
+
 func main() {
 	file, close := createLogFile()
 	defer close()
@@ -122,9 +132,11 @@ func main() {
 	server := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			logging.UnaryServerInterceptor(logger, logOpt...),
+			recovery.UnaryServerInterceptor(recovery.WithRecoveryHandler(recoveryHandler)),
 		),
 		grpc.ChainStreamInterceptor(
 			logging.StreamServerInterceptor(logger, logOpt...),
+			recovery.StreamServerInterceptor(recovery.WithRecoveryHandler(recoveryHandler)),
 		),
 	)
 	pb.RegisterGreeterServer(server, &GreeterServer{})
