@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -18,9 +17,12 @@ import (
 	pb "github.com/Arvin619/grpc-demo/proto"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/recovery"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var port string
@@ -80,39 +82,71 @@ func (gs *GreeterServer) SayRoute(srs pb.Greeter_SayRouteServer) error {
 	}
 }
 
-func createLogFile() (logFile *os.File, closeFun func()) {
-	var err error
-	if _, err = os.Stat("./log"); errors.Is(err, os.ErrNotExist) {
-		if err = os.Mkdir("./log", os.ModePerm); err != nil {
-			panic(err)
-		}
+func getEncoder() zapcore.Encoder {
+	encoderConfig := zap.NewDevelopmentEncoderConfig()
+	{
+		encoderConfig.LevelKey = "level"
+		encoderConfig.TimeKey = zapcore.OmitKey
+		encoderConfig.MessageKey = "msg"
 	}
-	logFileName := time.Now().Format(time.ANSIC) + ".log"
-	logFile, err = os.Create(filepath.Join("./log", logFileName))
-	if err != nil {
-		panic(err)
-	}
-	closeFun = func() {
-		logFile.Close()
-	}
-	return
+
+	return zapcore.NewJSONEncoder(encoderConfig)
 }
 
-func InterceptorLogger(l *log.Logger) logging.Logger {
-	return logging.LoggerFunc(func(_ context.Context, lvl logging.Level, msg string, fields ...any) {
+func createLogFile() *zap.Logger {
+	core := zapcore.NewCore(
+		getEncoder(),
+		zapcore.NewMultiWriteSyncer(
+			zapcore.AddSync(
+				&lumberjack.Logger{
+					Filename:   "./log/grpc-zap.log",
+					MaxSize:    100, // megabytes
+					MaxBackups: 5,
+					MaxAge:     28,   //days
+					Compress:   true, // disabled by default
+				}),
+			zapcore.AddSync(os.Stdout),
+		),
+		zapcore.DebugLevel,
+	)
+	logger := zap.New(core)
+	return logger
+}
+
+func InterceptorLogger(l *zap.Logger) logging.Logger {
+	return logging.LoggerFunc(func(ctx context.Context, lvl logging.Level, msg string, fields ...any) {
+		f := make([]zap.Field, 0, len(fields)/2)
+
+		for i := 0; i < len(fields); i += 2 {
+			key := fields[i]
+			value := fields[i+1]
+
+			switch v := value.(type) {
+			case string:
+				f = append(f, zap.String(key.(string), v))
+			case int:
+				f = append(f, zap.Int(key.(string), v))
+			case bool:
+				f = append(f, zap.Bool(key.(string), v))
+			default:
+				f = append(f, zap.Any(key.(string), v))
+			}
+		}
+
+		logger := l.WithOptions(zap.AddCallerSkip(1)).With(f...)
+
 		switch lvl {
 		case logging.LevelDebug:
-			msg = fmt.Sprintf("DEBUG :%v", msg)
+			logger.Debug(msg)
 		case logging.LevelInfo:
-			msg = fmt.Sprintf("INFO :%v", msg)
+			logger.Info(msg)
 		case logging.LevelWarn:
-			msg = fmt.Sprintf("WARN :%v", msg)
+			logger.Warn(msg)
 		case logging.LevelError:
-			msg = fmt.Sprintf("ERROR :%v", msg)
+			logger.Error(msg)
 		default:
 			panic(fmt.Sprintf("unknown level %v", lvl))
 		}
-		l.Println(append([]any{"msg", msg}, fields...))
 	})
 }
 
@@ -121,21 +155,20 @@ func recoveryHandler(p any) error {
 }
 
 func main() {
-	file, close := createLogFile()
-	defer close()
+	logger := createLogFile()
+	defer logger.Sync()
 
-	logger := InterceptorLogger(log.New(io.MultiWriter(os.Stdout, file), "", log.Ldate|log.Ltime|log.Lshortfile))
 	logOpt := []logging.Option{
 		logging.WithLogOnEvents(logging.StartCall, logging.FinishCall),
 	}
 
 	server := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
-			logging.UnaryServerInterceptor(logger, logOpt...),
+			logging.UnaryServerInterceptor(InterceptorLogger(logger), logOpt...),
 			recovery.UnaryServerInterceptor(recovery.WithRecoveryHandler(recoveryHandler)),
 		),
 		grpc.ChainStreamInterceptor(
-			logging.StreamServerInterceptor(logger, logOpt...),
+			logging.StreamServerInterceptor(InterceptorLogger(logger), logOpt...),
 			recovery.StreamServerInterceptor(recovery.WithRecoveryHandler(recoveryHandler)),
 		),
 	)
